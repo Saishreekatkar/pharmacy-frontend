@@ -11,11 +11,9 @@ export async function GET() {
         id: b.bill_id,
         total: b.total_amount,   // updated
         date: b.date,            // updated
-        customer: {
-          name: b.customer_name,
-          phone: b.customer_phone,
-          age: b.customer_age,
-        }
+        customer_name: b.customer_name,   // 👈 add this
+        customer_phone: b.customer_phone, // optional
+        customer_age: b.customer_age      // optional
       })),
     });
 
