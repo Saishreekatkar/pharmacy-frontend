@@ -1,78 +1,88 @@
+// app/api/customers/refund/route.js
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 
 export async function POST(req) {
-  const { customer_id } = await req.json();
-  if (!customer_id) {
-    return NextResponse.json({ success: false, message: "customer_id required" }, { status: 400 });
-  }
+  const body = await req.json().catch(() => ({}));
+  const customer_id = parseInt(body?.customer_id, 10);
+  if (!customer_id) return NextResponse.json({ success: false, message: "customer_id required" }, { status: 400 });
 
   const conn = await db.getConnection();
   try {
     await conn.beginTransaction();
 
-    // 1️⃣ Get all bills for that customer
+    // load customer info (if gone, we still try to find bills by name/phone via provided body)
+    const [custRows] = await conn.query("SELECT name, phone FROM customers WHERE customer_id = ?", [customer_id]);
+    const cust = custRows[0] || {};
+
+    // find bills by id OR fallback to bills that have matching customer_name/customer_phone
     const [bills] = await conn.query(
-      "SELECT bill_id FROM bills WHERE customer_id = ?",
-      [customer_id]
+      `SELECT bill_id, customer_name, customer_phone, customer_id
+       FROM bills
+       WHERE customer_id = ?
+          OR (customer_id IS NULL AND (customer_name = ? OR customer_phone = ?))`,
+      [customer_id, cust.name || body?.name || "", cust.phone || body?.phone || ""]
     );
 
-    if (bills.length === 0) {
-      await conn.query("DELETE FROM customers WHERE customer_id = ?", [customer_id]);
+    if (!bills || bills.length === 0) {
+      // nothing to restore; delete customer record if exists
+      const [delCust] = await conn.query("DELETE FROM customers WHERE customer_id = ?", [customer_id]);
       await conn.commit();
-      return NextResponse.json({ success: true, message: "No bills found; customer deleted" });
+      return NextResponse.json({ success: true, message: "No bills found; customer deleted", deletedCustomers: delCust.affectedRows || 0 });
     }
 
-    const billIds = bills.map((b) => b.bill_id);
+    const billIds = bills.map(b => b.bill_id);
     const placeholders = billIds.map(() => "?").join(",");
 
-    // 2️⃣ Get bill_items grouped by medicine_id
+    // compute restore summary
     const [items] = await conn.query(
-      `SELECT medicine_id, SUM(quantity) AS restore_qty
-       FROM bill_items
-       WHERE bill_id IN (${placeholders})
-       GROUP BY medicine_id`,
+      `SELECT bi.medicine_id, SUM(bi.quantity) AS restore_qty
+       FROM bill_items bi
+       WHERE bi.bill_id IN (${placeholders})
+       GROUP BY bi.medicine_id`,
       billIds
     );
 
-    // 3️⃣ Restore stock
-    for (const item of items) {
+    // restore stock (use JOIN to update medicines)
+    if (items.length > 0) {
       await conn.query(
-        "UPDATE medicines SET quantity = quantity + ? WHERE medicine_id = ?",
-        [item.restore_qty, item.medicine_id]
+        `UPDATE medicines m
+         JOIN (
+           SELECT bi.medicine_id, SUM(bi.quantity) AS restore_qty
+           FROM bill_items bi
+           WHERE bi.bill_id IN (${placeholders})
+           GROUP BY bi.medicine_id
+         ) t ON m.medicine_id = t.medicine_id
+         SET m.quantity = m.quantity + t.restore_qty`,
+        [...billIds, ...billIds] // placeholders used twice
       );
     }
 
-    // 4️⃣ Delete bill_items
-    await conn.query(
-      `DELETE FROM bill_items WHERE bill_id IN (${placeholders})`,
-      billIds
-    );
+    // delete bill_items explicitly (in case FK isn't set). If ON DELETE CASCADE exists, this is redundant but safe.
+    await conn.query(`DELETE FROM bill_items WHERE bill_id IN (${placeholders})`, billIds);
 
-    // 5️⃣ Delete bills
-    await conn.query(
-      `DELETE FROM bills WHERE bill_id IN (${placeholders})`,
-      billIds
-    );
+    // delete bills
+    const [delBillsRes] = await conn.query(`DELETE FROM bills WHERE bill_id IN (${placeholders})`, billIds);
 
-    // 6️⃣ Delete customer
-    await conn.query(
-      "DELETE FROM customers WHERE customer_id = ?",
-      [customer_id]
-    );
+    // delete customer
+    const [delCustRes] = await conn.query("DELETE FROM customers WHERE customer_id = ?", [customer_id]);
 
     await conn.commit();
 
     return NextResponse.json({
       success: true,
-      message: "Refund complete — stock restored and customer deleted",
+      message: "Refund complete",
+      refundedBills: billIds.length,
+      deletedBills: delBillsRes.affectedRows || 0,
+      deletedCustomers: delCustRes.affectedRows || 0,
+      restoreSummary: items
     });
 
   } catch (err) {
     await conn.rollback();
     console.error("REFUND ERROR:", err);
-    return NextResponse.json({ success: false, message: "Refund failed" }, { status: 500 });
+    return NextResponse.json({ success: false, message: "Refund failed", error: String(err) }, { status: 500 });
   } finally {
-    conn.release();
+    try { conn.release(); } catch (_) {}
   }
 }
